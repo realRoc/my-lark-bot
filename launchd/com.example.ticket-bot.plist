@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd unit for the ticket bot poll worker.
+  Install:
+    1. Replace REPLACE_USERNAME and REPLACE_PROJECT_DIR below.
+    2. Rename file to your bundle id, e.g. com.yourcompany.ticket-bot.plist
+    3. Copy to ~/Library/LaunchAgents/ and load:
+         launchctl load -w ~/Library/LaunchAgents/com.yourcompany.ticket-bot.plist
+    4. Restart on config change:
+         launchctl kickstart -k gui/$(id -u)/com.yourcompany.ticket-bot
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.ticket-bot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/REPLACE_USERNAME/REPLACE_PROJECT_DIR/scripts/start_poll_worker.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/REPLACE_USERNAME/REPLACE_PROJECT_DIR</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/REPLACE_USERNAME/REPLACE_PROJECT_DIR/.state/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/REPLACE_USERNAME/REPLACE_PROJECT_DIR/.state/launchd.err.log</string>
+</dict>
+</plist>
