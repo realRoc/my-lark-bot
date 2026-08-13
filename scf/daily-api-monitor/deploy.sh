@@ -23,6 +23,17 @@ fetch_tat_output() {
   return 1
 }
 
+wait_for_active() {
+  local function_state
+  for _ in $(seq 1 30); do
+    function_state=$(tccli scf GetFunction --region "$region" --FunctionName "$function_name" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Status"])')
+    [[ "$function_state" == Active ]] && return
+    [[ "$function_state" == Failed ]] && return 1
+    sleep 2
+  done
+  return 1
+}
+
 export AMA_API_KEY
 AMA_API_KEY=$(fetch_tat_output ins-jihl2bqa 'docker exec askmany-monitor_backend_1 printenv API_KEY' | tr -d '\r\n')
 router_creds=$(fetch_tat_output ins-gch959xq 'docker exec teamocode-dashboard printenv DASHBOARD_USERNAME DASHBOARD_PASSWORD')
@@ -57,7 +68,9 @@ existing=$(tccli scf ListFunctions --region "$region" --Limit 100 | python3 -c '
 
 if [[ "$existing" == True ]]; then
   tccli scf UpdateFunctionCode --region "$region" --FunctionName "$function_name" --Handler index.main_handler --Code "$code_json" >/dev/null
+  wait_for_active
   tccli scf UpdateFunctionConfiguration --region "$region" --FunctionName "$function_name" --Timeout 240 --Environment "$environment_json" >/dev/null
+  wait_for_active
   echo "updated $function_name"
 else
   tccli scf CreateFunction --region "$region" --FunctionName "$function_name" --Description 'AMA and TeamoRouter API monitor to Feishu' --Code "$code_json" --Handler index.main_handler --Runtime Python3.10 --Timeout 240 --MemorySize 128 --Environment "$environment_json"
