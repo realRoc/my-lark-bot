@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-function_name=daily-api-monitor
+function_name=${FUNCTION_NAME:-daily-api-monitor}
 region=ap-hongkong
 
 fetch_tat_output() {
@@ -34,13 +34,14 @@ export ROUTER_BASE_URL='https://op.teamocode.com'
 : "${ASKMANY_USERNAME:?set ASKMANY_USERNAME}"
 : "${ASKMANY_PASSWORD:?set ASKMANY_PASSWORD}"
 export ASKMANY_BASE_URL="${ASKMANY_BASE_URL:-https://askmanyai.cn}"
+export DRY_RUN="${DRY_RUN:-0}"
 
 deploy_tmp=$(mktemp -d /tmp/daily-api-monitor-deploy.XXXXXX)
 zip -j -q "$deploy_tmp/code.zip" index.py
 base64 < "$deploy_tmp/code.zip" | tr -d '\n' > "$deploy_tmp/code.b64"
 python3 - <<'PY' > "$deploy_tmp/environment.json"
 import json, os
-keys = ["AMA_BASE_URL", "AMA_API_KEY", "ROUTER_BASE_URL", "ROUTER_USERNAME", "ROUTER_PASSWORD", "FEISHU_WEBHOOK_URL", "ASKMANY_BASE_URL", "ASKMANY_USERNAME", "ASKMANY_PASSWORD"]
+keys = ["AMA_BASE_URL", "AMA_API_KEY", "ROUTER_BASE_URL", "ROUTER_USERNAME", "ROUTER_PASSWORD", "FEISHU_WEBHOOK_URL", "ASKMANY_BASE_URL", "ASKMANY_USERNAME", "ASKMANY_PASSWORD", "DRY_RUN"]
 print(json.dumps({"Variables": [{"Key": key, "Value": os.environ[key]} for key in keys]}))
 PY
 code_json=$(python3 -c 'import json,sys; print(json.dumps({"ZipFile": open(sys.argv[1]).read()}))' "$deploy_tmp/code.b64")

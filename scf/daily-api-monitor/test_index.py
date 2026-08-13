@@ -104,6 +104,27 @@ class MonitorTest(unittest.TestCase):
         self.assertIn(index.ROUTER_DISCOUNT_DASHBOARD_URL, text)
         self.assertIn(index.ROUTER_SUCCESS_DASHBOARD_URL, text)
 
+    def test_dry_run_collects_without_sending_feishu_card(self):
+        normal = {"alert": False}
+        ama = {**normal, "rate": 0.01, "errors": 1, "requests": 10000}
+        discount = {**normal, "rows": [], "start": "a", "end": "b", "total_requests": 10}
+        success = {**normal, "rate": 99.9, "total": 10}
+        ttft = {**normal, "rows": []}
+        images = {**normal, "rows": []}
+        with (
+            patch.dict(os.environ, {"DRY_RUN": "1"}, clear=False),
+            patch.object(index, "_ama", return_value=ama),
+            patch.object(index, "_discount", return_value=discount),
+            patch.object(index, "_success", return_value=success),
+            patch.object(index, "_ttft", return_value=ttft),
+            patch.object(index, "_images", return_value=images),
+            patch.object(index, "_request_json") as request_json,
+        ):
+            result = index.main_handler({}, None)
+
+        self.assertTrue(result["dry_run"])
+        request_json.assert_not_called()
+
     def test_weekday_mentions_fixed_people_and_next_hour_duty(self):
         monday_1050 = index.datetime(2026, 7, 20, 2, 50, tzinfo=index.timezone.utc)
         line = index._mention_line(monday_1050)

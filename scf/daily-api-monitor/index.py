@@ -429,9 +429,15 @@ def main_handler(event, context):
     ttft = _collect("AskManyAI TTFT", _ttft)
     images = _collect("AskManyAI 图片生成", _images)
     card = _card(now, ama, discount, success, ttft, images)
-    response = _request_json(os.environ["FEISHU_WEBHOOK_URL"], body=card, timeout=20)
-    if response.get("code", response.get("StatusCode", 0)) != 0:
-        raise RuntimeError(f"Feishu webhook rejected report: {response}")
-    result = {"ok": True, "alert": any(x.get("alert") for x in (ama, discount, success, ttft, images))}
+    dry_run = os.environ.get("DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not dry_run:
+        response = _request_json(os.environ["FEISHU_WEBHOOK_URL"], body=card, timeout=20)
+        if response.get("code", response.get("StatusCode", 0)) != 0:
+            raise RuntimeError(f"Feishu webhook rejected report: {response}")
+    result = {
+        "ok": True,
+        "alert": any(x.get("alert") for x in (ama, discount, success, ttft, images)),
+        "dry_run": dry_run,
+    }
     print(json.dumps(result, ensure_ascii=False))
     return result
