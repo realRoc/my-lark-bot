@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 function_name=${FUNCTION_NAME:-daily-api-monitor}
 region=ap-hongkong
@@ -37,6 +38,12 @@ export ASKMANY_BASE_URL="${ASKMANY_BASE_URL:-https://askmanyai.cn}"
 export DRY_RUN="${DRY_RUN:-0}"
 
 deploy_tmp=$(mktemp -d /tmp/daily-api-monitor-deploy.XXXXXX)
+cleanup() {
+  if [[ -n "${deploy_tmp:-}" && "$deploy_tmp" == /tmp/daily-api-monitor-deploy.* ]]; then
+    find "$deploy_tmp" -depth -delete
+  fi
+}
+trap cleanup EXIT
 zip -j -q "$deploy_tmp/code.zip" index.py
 base64 < "$deploy_tmp/code.zip" | tr -d '\n' > "$deploy_tmp/code.b64"
 python3 - <<'PY' > "$deploy_tmp/environment.json"
