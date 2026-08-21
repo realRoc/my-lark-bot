@@ -28,7 +28,7 @@ DISCOUNT_MODEL_THRESHOLDS = {
 }
 AMA_DASHBOARD_URL = "http://43.159.11.241:3000/"
 ROUTER_DISCOUNT_DASHBOARD_URL = "https://op.teamocode.com/discount-rate"
-ROUTER_SUCCESS_DASHBOARD_URL = "https://op.teamocode.com/request-status"
+ROUTER_SUCCESS_DASHBOARD_URL = "https://op.teamocode.com/channel-monitoring"
 WU_YUPENG = "ou_98e6339957c6b8ff83ae7afbc72a1ee0"
 LI_SHUFAN = "ou_0e3da4c3e50d087359cae8a4de4f9024"
 SHE_RUIXU = "ou_9b234971cb8284e4a67065a9fab75c45"
@@ -53,6 +53,9 @@ IMAGE_MODELS = (
     {"label": "Nano Banana 2", "engine": "gemini-3.1-flash-image-preview", "threshold": 120},
     {"label": "GPT-Image-2", "engine": "gpt-image-2", "threshold": 180},
 )
+WINDOW_TOLERANCE_SECONDS = 1.0
+WINDOW_REFRESH_ATTEMPTS = 7
+WINDOW_REFRESH_DELAY_SECONDS = 2
 
 
 def _request_json(url, *, headers=None, body=None, timeout=55):
@@ -66,6 +69,46 @@ def _request_json(url, *, headers=None, body=None, timeout=55):
     except urllib.error.HTTPError as exc:
         detail = exc.read(1000).decode("utf-8", "replace")
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+
+
+def _parse_window_time(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"响应缺少 {field}")
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise RuntimeError(f"响应 {field} 不是有效时间：{value}") from exc
+    if parsed.tzinfo is None:
+        raise RuntimeError(f"响应 {field} 缺少时区：{value}")
+    return parsed
+
+
+def _validate_window(name, expected_start, expected_end, actual_start, actual_end):
+    actual_start_dt = _parse_window_time(actual_start, "start")
+    actual_end_dt = _parse_window_time(actual_end, "end")
+    start_delta = abs((actual_start_dt - expected_start).total_seconds())
+    end_delta = abs((actual_end_dt - expected_end).total_seconds())
+    if start_delta > WINDOW_TOLERANCE_SECONDS or end_delta > WINDOW_TOLERANCE_SECONDS:
+        expected = f"{expected_start.isoformat()} ~ {expected_end.isoformat()}"
+        actual = f"{actual_start_dt.isoformat()} ~ {actual_end_dt.isoformat()}"
+        raise RuntimeError(f"{name} 返回错窗：请求 {expected}，实际 {actual}")
+    return actual_start_dt, actual_end_dt
+
+
+def _validate_date_window(name, expected_start, expected_end, actual_start, actual_end):
+    expected_start_date = expected_start.astimezone(BEIJING).strftime("%Y-%m-%d")
+    expected_end_date = expected_end.astimezone(BEIJING).strftime("%Y-%m-%d")
+    if actual_start != expected_start_date or actual_end != expected_end_date:
+        expected = f"{expected_start_date} ~ {expected_end_date}"
+        actual = f"{actual_start or 'missing'} ~ {actual_end or 'missing'}"
+        raise RuntimeError(f"{name} 返回错窗日期：请求 {expected}，实际 {actual}")
+
+
+def _window_label(start, end):
+    return f"{start.astimezone(BEIJING):%Y-%m-%d %H:%M:%S} ~ {end.astimezone(BEIJING):%H:%M:%S}"
 
 
 def _ama(now):
@@ -82,6 +125,14 @@ def _ama(now):
     )
     summary = payload.get("summary") or {}
     metadata = payload.get("metadata") or {}
+    time_range = metadata.get("time_range") or {}
+    actual_start, actual_end = _validate_window(
+        "AMA 二维码报警率",
+        start,
+        now,
+        time_range.get("start"),
+        time_range.get("end"),
+    )
     rate = float(summary.get("alert_rate") or 0)
     coverage_warning = bool(metadata.get("coverage_warning"))
     return {
@@ -90,12 +141,21 @@ def _ama(now):
         "errors": int(summary.get("total") or 0),
         "requests": int(summary.get("total_requests") or 0),
         "coverage_warning": coverage_warning,
+        "start": actual_start,
+        "end": actual_end,
     }
 
 
 def _router_headers():
     raw = f"{os.environ['ROUTER_USERNAME']}:{os.environ['ROUTER_PASSWORD']}".encode()
-    return {"authorization": "Basic " + base64.b64encode(raw).decode()}
+    return {
+        "authorization": "Basic " + base64.b64encode(raw).decode(),
+        # The dashboard is behind a shared response cache that can otherwise
+        # serve a previous time window even when start_ts/end_ts and refresh=1
+        # are present in the URL.
+        "cache-control": "no-cache",
+        "pragma": "no-cache",
+    }
 
 
 def _router(path, params=None):
@@ -115,8 +175,8 @@ def _discount_family(model):
     return None
 
 
-def _discount():
-    end = datetime.now(BEIJING)
+def _discount(now=None):
+    end = now or datetime.now(BEIJING)
     start = end - timedelta(minutes=DISCOUNT_WINDOW_MINUTES)
     payload = _router("discount-rate", {
         "start": start.strftime("%Y-%m-%d"),
@@ -124,6 +184,13 @@ def _discount():
         "start_ts": start.isoformat(timespec="seconds"),
         "end_ts": end.isoformat(timespec="seconds"),
     })
+    _validate_date_window(
+        "Router 折扣率",
+        start,
+        end,
+        payload.get("start"),
+        payload.get("end"),
+    )
     rows = []
     for item in payload.get("models") or []:
         model = str(item.get("model") or "")
@@ -154,30 +221,53 @@ def _discount():
         "alert": any(row["alert"] for row in rows),
         "rows": rows,
         "total_requests": int(payload.get("total_reqs") or 0),
-        "start": payload.get("start"),
-        "end": payload.get("end"),
+        # discount-rate currently echoes only YYYY-MM-DD even for precise
+        # start_ts/end_ts requests. Keep the exact requested window instead of
+        # presenting that lossy response as if it were the measured range.
+        "start": start,
+        "end": end,
     }
 
 
-def _success():
-    end = datetime.now(BEIJING)
+def _success(now=None):
+    end = now or datetime.now(BEIJING)
     start = end - timedelta(minutes=30)
-    payload = _router("request-status", {
+    params = {
         "start": start.strftime("%Y-%m-%d"),
         "end": end.strftime("%Y-%m-%d"),
         "start_ts": start.isoformat(timespec="seconds"),
         "end_ts": end.isoformat(timespec="seconds"),
-    })
-    rate = payload.get("success_rate")
-    if rate is None and isinstance(payload.get("summary"), dict):
-        rate = payload["summary"].get("success_rate")
+        "include_logs": "0",
+        "refresh": "1",
+    }
+    for attempt in range(WINDOW_REFRESH_ATTEMPTS):
+        payload = _router("channel-monitoring", params)
+        try:
+            actual_start, actual_end = _validate_window(
+                "Router 请求成功率",
+                start,
+                end,
+                payload.get("start"),
+                payload.get("end"),
+            )
+            break
+        except RuntimeError:
+            if attempt + 1 >= WINDOW_REFRESH_ATTEMPTS:
+                raise
+            # refresh=1 currently starts a distributed-cache refresh but may
+            # return the previous live-span value first. Poll the same exact
+            # window until that refresh becomes visible; validation remains
+            # authoritative, so an unresolved race becomes an alert.
+            time.sleep(WINDOW_REFRESH_DELAY_SECONDS)
+    summary = payload.get("summary") or {}
+    rate = summary.get("success_rate")
     rate = None if rate is None else float(rate)
     return {
         "alert": rate is None or rate <= ROUTER_SUCCESS_THRESHOLD,
         "rate": rate,
-        "total": int(payload.get("total_reqs") or 0),
-        "start": payload.get("start"),
-        "end": payload.get("end"),
+        "total": int(summary.get("request_count") or 0),
+        "start": actual_start,
+        "end": actual_end,
         "warnings": payload.get("warnings") or [],
     }
 
@@ -373,7 +463,7 @@ def _fmt_discount(result):
         parts.append("未告警(<30次)：" + "；".join(map(fmt, observed)))
     if not parts:
         parts.append("全部通过")
-    return f"{result.get('start')} ~ {result.get('end')}，总请求 {result['total_requests']}；" + "；".join(parts)
+    return f"{_window_label(result['start'], result['end'])}，总请求 {result['total_requests']}；" + "；".join(parts)
 
 
 def _mention_line(now):
@@ -401,13 +491,13 @@ def _card(now, ama, discount, success, ttft=None, images=None):
     images = images or {"alert": False, "rows": []}
     alert = any(x.get("alert") for x in (ama, discount, success, ttft, images))
     color = "red" if alert else "green"
-    ama_text = ama.get("error") or f"{ama['rate']:.2f}%（{ama['errors']}/{ama['requests']}，阈值 < {AMA_THRESHOLD}%）"
+    ama_text = ama.get("error") or f"{_window_label(ama['start'], ama['end'])}；{ama['rate']:.2f}%（{ama['errors']}/{ama['requests']}，阈值 < {AMA_THRESHOLD}%）"
     if ama.get("coverage_warning"):
         ama_text += "；CLS 覆盖不完整"
     success_text = success.get("error")
     if not success_text:
         shown = "N/A" if success["rate"] is None else f"{success['rate']:.2f}%"
-        success_text = f"{shown}（总请求 {success['total']}，阈值 > {ROUTER_SUCCESS_THRESHOLD}%）"
+        success_text = f"{_window_label(success['start'], success['end'])}；{shown}（总请求 {success['total']}，阈值 > {ROUTER_SUCCESS_THRESHOLD}%）"
     elements = [
         {"tag": "markdown", "content": f"**时间：** {now.astimezone(BEIJING):%Y-%m-%d %H:%M:%S} 北京时间"},
         {"tag": "markdown", "content": _mention_line(now)},
@@ -423,9 +513,10 @@ def _card(now, ama, discount, success, ttft=None, images=None):
 
 def main_handler(event, context):
     now = datetime.now(timezone.utc)
+    router_now = now.astimezone(BEIJING)
     ama = _collect("AMA 报警率", lambda: _ama(now))
-    discount = _collect("Router 折扣率", _discount)
-    success = _collect("Router 成功率", _success)
+    discount = _collect("Router 折扣率", lambda: _discount(router_now))
+    success = _collect("Router 成功率", lambda: _success(router_now))
     ttft = _collect("AskManyAI TTFT", _ttft)
     images = _collect("AskManyAI 图片生成", _images)
     card = _card(now, ama, discount, success, ttft, images)
