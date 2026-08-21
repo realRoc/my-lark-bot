@@ -6,14 +6,32 @@ import index
 
 
 class MonitorTest(unittest.TestCase):
+    FIXED_NOW = index.datetime(2026, 8, 21, 17, 0, tzinfo=index.BEIJING)
+
+    @classmethod
+    def window_payload(cls, **extra):
+        return {
+            "start": (cls.FIXED_NOW - index.timedelta(minutes=30)).isoformat(),
+            "end": cls.FIXED_NOW.isoformat(),
+            **extra,
+        }
+
+    @classmethod
+    def discount_payload(cls, **extra):
+        return {
+            "start": cls.FIXED_NOW.strftime("%Y-%m-%d"),
+            "end": cls.FIXED_NOW.strftime("%Y-%m-%d"),
+            **extra,
+        }
+
     def test_discount_threshold_and_minimum_requests(self):
-        payload = {"start": "a", "end": "b", "total_reqs": 100, "models": [
+        payload = self.discount_payload(total_reqs=100, models=[
             {"model": "gpt-x", "reqs": 30, "avg_effective_provider_discount_rate": 0.1501},
             {"model": "claude-x", "reqs": 29, "avg_effective_provider_discount_rate": 0.31},
             {"model": "gpt-image-2", "reqs": 100, "avg_effective_provider_discount_rate": 0.4},
-        ]}
+        ])
         with patch.object(index, "_router", return_value=payload) as router:
-            result = index._discount()
+            result = index._discount(self.FIXED_NOW)
         self.assertTrue(result["alert"])
         self.assertTrue(result["rows"][0]["alert"])
         self.assertTrue(result["rows"][1]["observed"])
@@ -23,28 +41,40 @@ class MonitorTest(unittest.TestCase):
         start = index.datetime.fromisoformat(params["start_ts"])
         end = index.datetime.fromisoformat(params["end_ts"])
         self.assertEqual(end - start, index.timedelta(minutes=30))
+        self.assertEqual(result["start"], start)
+        self.assertEqual(result["end"], end)
+
+    def test_router_requests_bypass_shared_response_cache(self):
+        with patch.dict(os.environ, {
+            "ROUTER_USERNAME": "user",
+            "ROUTER_PASSWORD": "password",
+        }):
+            headers = index._router_headers()
+        self.assertEqual(headers["cache-control"], "no-cache")
+        self.assertEqual(headers["pragma"], "no-cache")
+        self.assertTrue(headers["authorization"].startswith("Basic "))
 
     def test_discount_dynamically_classifies_new_models(self):
-        payload = {"start": "a", "end": "b", "total_reqs": 200, "models": [
+        payload = self.discount_payload(total_reqs=200, models=[
             {"model": "gpt-9-new", "reqs": 50, "avg_effective_provider_discount_rate": 0.151},
             {"model": "codex-next", "reqs": 50, "avg_effective_provider_discount_rate": 0.151},
             {"model": "claude-future", "reqs": 50, "avg_effective_provider_discount_rate": 0.301},
             {"model": "gemini-future", "reqs": 50, "avg_effective_provider_discount_rate": 0.301},
-        ]}
+        ])
         with patch.object(index, "_router", return_value=payload):
-            result = index._discount()
+            result = index._discount(self.FIXED_NOW)
         self.assertEqual([row["model"] for row in result["rows"]], [
             "gpt-9-new", "codex-next", "claude-future", "gemini-future",
         ])
         self.assertTrue(all(row["alert"] for row in result["rows"]))
 
     def test_discount_uses_luna_model_threshold_without_changing_gpt_family(self):
-        payload = {"start": "a", "end": "b", "total_reqs": 4724, "models": [
+        payload = self.discount_payload(total_reqs=4724, models=[
             {"model": "gpt-5.6-luna", "reqs": 2362, "avg_effective_provider_discount_rate": 0.3526},
             {"model": "gpt-5.6-sol", "reqs": 2362, "avg_effective_provider_discount_rate": 0.3526},
-        ]}
+        ])
         with patch.object(index, "_router", return_value=payload):
-            result = index._discount()
+            result = index._discount(self.FIXED_NOW)
 
         luna, sol = result["rows"]
         self.assertEqual(luna["threshold"], 0.40)
@@ -53,15 +83,21 @@ class MonitorTest(unittest.TestCase):
         self.assertTrue(sol["alert"])
 
     def test_discount_matches_dashboard_strict_thresholds(self):
-        payload = {"start": "a", "end": "b", "total_reqs": 90, "models": [
+        payload = self.discount_payload(total_reqs=90, models=[
             {"model": "gpt-edge", "reqs": 30, "avg_effective_provider_discount_rate": 0.15},
             {"model": "claude-edge", "reqs": 30, "avg_effective_provider_discount_rate": 0.30},
             {"model": "gemini-edge", "reqs": 30, "avg_effective_provider_discount_rate": 0.30},
-        ]}
+        ])
         with patch.object(index, "_router", return_value=payload):
-            result = index._discount()
+            result = index._discount(self.FIXED_NOW)
         self.assertFalse(result["alert"])
         self.assertFalse(any(row["alert"] for row in result["rows"]))
+
+    def test_discount_rejects_mismatched_response_date(self):
+        payload = {"start": "2026-08-20", "end": "2026-08-20", "total_reqs": 90, "models": []}
+        with patch.object(index, "_router", return_value=payload):
+            with self.assertRaisesRegex(RuntimeError, "返回错窗日期"):
+                index._discount(self.FIXED_NOW)
 
     def test_collection_failure_is_alert(self):
         result = index._collect("x", lambda: (_ for _ in ()).throw(RuntimeError("bad")))
@@ -69,46 +105,122 @@ class MonitorTest(unittest.TestCase):
         self.assertIn("采集失败", result["error"])
 
     def test_ama_incomplete_coverage_is_only_a_note(self):
+        now = self.FIXED_NOW.astimezone(index.timezone.utc)
         payload = {
             "summary": {"alert_rate": 0.05, "total": 7, "total_requests": 13737},
-            "metadata": {"coverage_warning": True},
+            "metadata": {
+                "coverage_warning": True,
+                "time_range": {
+                    "start": (now - index.timedelta(hours=1)).isoformat(),
+                    "end": now.isoformat(),
+                },
+            },
         }
         with patch.object(index, "_request_json", return_value=payload), patch.dict(os.environ, {
             "AMA_BASE_URL": "http://ama",
             "AMA_API_KEY": "key",
         }):
-            result = index._ama(index.datetime.now(index.timezone.utc))
+            result = index._ama(now)
         self.assertFalse(result["alert"])
         self.assertTrue(result["coverage_warning"])
 
+    def test_ama_rejects_mismatched_response_window(self):
+        now = self.FIXED_NOW.astimezone(index.timezone.utc)
+        payload = {
+            "summary": {"alert_rate": 0.05, "total": 7, "total_requests": 13737},
+            "metadata": {
+                "time_range": {
+                    "start": (now - index.timedelta(hours=2)).isoformat(),
+                    "end": (now - index.timedelta(hours=1)).isoformat(),
+                },
+            },
+        }
+        with patch.object(index, "_request_json", return_value=payload), patch.dict(os.environ, {
+            "AMA_BASE_URL": "http://ama",
+            "AMA_API_KEY": "key",
+        }):
+            with self.assertRaisesRegex(RuntimeError, "返回错窗"):
+                index._ama(now)
+
     def test_success_uses_rolling_thirty_minutes(self):
-        payload = {"success_rate": 99.35, "total_reqs": 208735}
+        payload = self.window_payload(summary={"success_rate": 99.35, "request_count": 208735})
         with patch.object(index, "_router", return_value=payload) as router:
-            result = index._success()
+            result = index._success(self.FIXED_NOW)
         self.assertFalse(result["alert"])
+        self.assertEqual(result["total"], 208735)
+        self.assertEqual(router.call_args.args[0], "channel-monitoring")
         params = router.call_args.args[1]
         start = index.datetime.fromisoformat(params["start_ts"])
         end = index.datetime.fromisoformat(params["end_ts"])
         self.assertEqual(params["start"], start.strftime("%Y-%m-%d"))
         self.assertEqual(params["end"], end.strftime("%Y-%m-%d"))
         self.assertEqual(end - start, index.timedelta(minutes=30))
+        self.assertEqual(params["include_logs"], "0")
+        self.assertEqual(params["refresh"], "1")
+
+    def test_success_rejects_stale_response_window(self):
+        stale_start = self.FIXED_NOW - index.timedelta(minutes=90)
+        stale_end = self.FIXED_NOW - index.timedelta(minutes=60)
+        payload = {
+            "start": stale_start.isoformat(),
+            "end": stale_end.isoformat(),
+            "summary": {"success_rate": 96.53, "request_count": 55337},
+        }
+        with patch.object(index, "_router", return_value=payload) as router, patch.object(index.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "返回错窗"):
+                index._success(self.FIXED_NOW)
+        self.assertEqual(router.call_count, index.WINDOW_REFRESH_ATTEMPTS)
+        self.assertEqual(sleep.call_count, index.WINDOW_REFRESH_ATTEMPTS - 1)
+
+    def test_success_waits_for_exact_window_after_background_refresh(self):
+        stale = {
+            "start": (self.FIXED_NOW - index.timedelta(minutes=90)).isoformat(),
+            "end": (self.FIXED_NOW - index.timedelta(minutes=60)).isoformat(),
+            "summary": {"success_rate": 96.53, "request_count": 55337},
+        }
+        current = self.window_payload(summary={"success_rate": 98.95, "request_count": 46395})
+        with patch.object(index, "_router", side_effect=[stale, current]) as router, patch.object(index.time, "sleep") as sleep:
+            result = index._success(self.FIXED_NOW)
+        self.assertEqual(router.call_count, 2)
+        sleep.assert_called_once_with(index.WINDOW_REFRESH_DELAY_SECONDS)
+        self.assertEqual(result["rate"], 98.95)
+        self.assertEqual(result["total"], 46395)
+
+    def test_collect_turns_stale_window_into_collection_alert(self):
+        payload = {
+            "start": (self.FIXED_NOW - index.timedelta(minutes=90)).isoformat(),
+            "end": (self.FIXED_NOW - index.timedelta(minutes=60)).isoformat(),
+            "summary": {"success_rate": 96.53, "request_count": 55337},
+        }
+        with patch.object(index, "_router", return_value=payload), patch.object(index.time, "sleep"):
+            result = index._collect("Router 成功率", lambda: index._success(self.FIXED_NOW))
+        self.assertTrue(result["alert"])
+        self.assertIn("返回错窗", result["error"])
 
     def test_card_contains_production_dashboard_links(self):
         normal = {"alert": False}
-        ama = {**normal, "rate": 0.01, "errors": 1, "requests": 10000}
+        ama = {**normal, "rate": 0.01, "errors": 1, "requests": 10000,
+               "start": self.FIXED_NOW - index.timedelta(hours=1), "end": self.FIXED_NOW}
         discount = {**normal, "rows": [], "start": "a", "end": "b", "total_requests": 10}
-        success = {**normal, "rate": 99.9, "total": 10}
+        discount["start"] = self.FIXED_NOW - index.timedelta(minutes=30)
+        discount["end"] = self.FIXED_NOW
+        success = {**normal, "rate": 99.9, "total": 10,
+                   "start": self.FIXED_NOW - index.timedelta(minutes=30), "end": self.FIXED_NOW}
         card = index._card(index.datetime.now(index.timezone.utc), ama, discount, success)
         text = "\n".join(item.get("content", "") for item in card["card"]["elements"])
         self.assertIn(index.AMA_DASHBOARD_URL, text)
         self.assertIn(index.ROUTER_DISCOUNT_DASHBOARD_URL, text)
         self.assertIn(index.ROUTER_SUCCESS_DASHBOARD_URL, text)
+        self.assertIn("2026-08-21 16:30:00 ~ 17:00:00", text)
 
     def test_dry_run_collects_without_sending_feishu_card(self):
         normal = {"alert": False}
-        ama = {**normal, "rate": 0.01, "errors": 1, "requests": 10000}
-        discount = {**normal, "rows": [], "start": "a", "end": "b", "total_requests": 10}
-        success = {**normal, "rate": 99.9, "total": 10}
+        ama = {**normal, "rate": 0.01, "errors": 1, "requests": 10000,
+               "start": self.FIXED_NOW - index.timedelta(hours=1), "end": self.FIXED_NOW}
+        discount = {**normal, "rows": [], "start": self.FIXED_NOW - index.timedelta(minutes=30),
+                    "end": self.FIXED_NOW, "total_requests": 10}
+        success = {**normal, "rate": 99.9, "total": 10,
+                   "start": self.FIXED_NOW - index.timedelta(minutes=30), "end": self.FIXED_NOW}
         ttft = {**normal, "rows": []}
         images = {**normal, "rows": []}
         with (
